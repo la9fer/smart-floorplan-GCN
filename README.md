@@ -1,4 +1,4 @@
-# Smart Floorplan — GCN-Based Congestion Predictor
+# Smart Floorplan : GCN Based Congestion Predictor
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?style=flat-square&logo=pytorch&logoColor=white)
