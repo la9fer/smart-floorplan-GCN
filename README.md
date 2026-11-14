@@ -163,7 +163,7 @@ Evaluated on 150 held-out test floorplans (~2,200 macro nodes):
 | Test F1 (congested class) | ~0.78 |
 | Inference time (CPU, single graph) | < 5 ms |
 
-The model generalises well to unseen macro counts (8–20) and connectivity densities, suggesting it has learned spatial-relational patterns rather than just memorising degree distributions.
+The model achieves approximately 82% test accuracy and 0.78 F1 on held-out synthetic floorplans. These results suggest that graph-based spatial and connectivity features can capture useful congestion patterns within the simulated data distribution. Validation on real-world floorplans remains future work.
 
 **Ablation note:** Removing edge attributes (wire length) drops F1 by ~4%, confirming that wire length context helps beyond node features alone.
 
