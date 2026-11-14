@@ -190,8 +190,11 @@ This project is motivated by the Smart Floorplan problem: using historical place
 
 ## Author
 
-**[Your Name]**  
-M.Sc. Mathematics + B.E. Electrical & Electronics Engineering  
-BITS Pilani
+**Lakshya Arora**
 
-*Built as part of exploring ML applications in physical design workflows.*
+Integrated M.Sc. Mathematics + B.E. Electrical & Electronics Engineering  
+BITS Pilani, K.K. Birla Goa Campus
+
+[GitHub](https://github.com/la9fer) · [LinkedIn](https://www.linkedin.com/in/lakshya-arora-51100329a/)
+
+Built as part of exploring machine learning applications in physical design workflows.
