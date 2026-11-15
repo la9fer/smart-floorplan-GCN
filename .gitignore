@@ -1,12 +1,32 @@
+# Generated datasets
 data/
+
+# Model checkpoints and experiment outputs
 results/
-__pycache__/
-*.pyc
-*.pth
 *.pt
-.DS_Store
-.env
+*.pth
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
 venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.*
+
+# Packaging and build artifacts
 *.egg-info/
 dist/
 build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Operating system
+.DS_Store
