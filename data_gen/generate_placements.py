@@ -1,4 +1,3 @@
-
 """
 Generates synthetic floorplan placement data for training a
 Graph Convolutional Network (GCN).
