@@ -1,103 +1,198 @@
-# Smart Floorplan : GCN Based Congestion Predictor
+# Smart Floorplan: GCN-Based Congestion Predictor
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?style=flat-square&logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?style=flat-square&logo=pytorch&logoColor=white)
 ![PyG](https://img.shields.io/badge/PyTorch_Geometric-2.4+-orange?style=flat-square)
-![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)
-![Status](https://img.shields.io/badge/Status-Active-brightgreen?style=flat-square)
+![Status](https://img.shields.io/badge/Status-Development-blue?style=flat-square)
 
-> Predicting congestion **Red Zones** in chip floorplans using Graph Convolutional Networks — before routing begins.
+A graph-based machine learning project exploring node-level congestion classification in synthetic chip floorplans using Graph Convolutional Networks (GCNs)
+
+The objective is to investigate whether macro geometry and graph connectivity can provide useful signals for identifying potentially congested regions in a floorplan.
 
 ---
 
 ## Motivation
 
-In physical design, a floorplan with poor macro placement leads to **routing congestion** — regions where there are more nets to route than available tracks. Detecting these zones early (pre-route) can save hours of signoff iteration.
+In VLSI physical design, macro placement and net connectivity influence the difficulty of subsequent routing. Poor placement can contribute to routing congestion, where routing demand exceeds the available resources.
 
-Traditional approaches rely on post-placement tools running full routing estimation, which is expensive. This project explores whether a lightweight **GCN**, trained on synthetic placement data, can predict congested macros directly from **placement coordinates + netlist connectivity** — in milliseconds.
+Identifying potentially problematic regions early could help guide placement decisions and reduce downstream design iterations.
 
-**Key insight from graph theory:** Congestion at a macro is not independent — it propagates through the net graph. A highly connected macro *surrounded by close neighbours* creates a local hotspot. GCN naturally captures this by aggregating neighbourhood information across the graph, analogous to how local density in a graph influences node centrality.
+This project explores a lightweight graph-learning approach. Each floorplan is represented as a graph, with macros as nodes and connectivity relationships as edges. A Graph Convolutional Network performs node-level binary classification using macro geometry and neighbourhood information.
+
+The current implementation uses synthetically generated floorplans and heuristic congestion labels. It is an experimental framework rather than a validated physical-design congestion estimator.
 
 ---
 
 ## Project Structure
 
-```
+```text
 smart-floorplan-gcn/
 │
 ├── data_gen/
 │   └── generate_placements.py   # Synthetic floorplan generator
 │
 ├── model/
-│   ├── dataset.py               # PyTorch Geometric Dataset
-│   └── gcn_model.py             # 3-layer GCN architecture
+│   ├── dataset.py               # PyTorch Geometric dataset
+│   └── gcn_model.py             # GCN architecture
 │
-├── results/                     # Saved checkpoints + plots (git-ignored)
+├── results/                     # Checkpoints and outputs (git-ignored)
 │
-├── train.py                     # Training loop with early stopping
-├── predict.py                   # Inference + congestion visualisation
+├── train.py                     # Training and validation
+├── predict.py                   # Inference and visualisation
 ├── requirements.txt
 └── README.md
 ```
 
 ---
 
-## Method
+## Methodology
 
-### Problem Formulation
+### 1. Graph Representation
 
-Each floorplan is modelled as a **graph G = (V, E)**:
+Each synthetic floorplan is represented as a graph:
 
-| Element | Meaning |
+\[
+G = (V,E)
+\]
+
+| Element | Description |
 |---|---|
-| **Node** v ∈ V | One macro block (IP, SRAM, logic tile) |
-| **Edge** (u,v) ∈ E | A net connecting two macros |
-| **Node features** | `[cx, cy, w, h, area, aspect_ratio]` — all normalised to [0,1] |
-| **Edge attribute** | Manhattan distance between macro centres (wire length proxy) |
-| **Label** | Binary: `1 = congested`, `0 = clear` |
+| Node \(v \in V\) | A macro block |
+| Edge \((u,v) \in E\) | A connectivity relationship between two macros |
+| Node features | Normalised macro geometry |
+| Edge attribute | Normalised Manhattan distance between macro centres |
+| Label | Binary congestion class: 0 or 1 |
 
-The task is **node-level binary classification** — predict congestion at each macro given the global placement context.
+The six node features are:
 
-### Why GCN?
+- Normalised centre x-coordinate
+- Normalised centre y-coordinate
+- Normalised width
+- Normalised height
+- Normalised area
+- Aspect ratio
 
-A plain MLP on individual macros ignores relational structure. GCN addresses this through **message passing**:
+The dataset also stores Manhattan distances between connected macro centres as edge attributes. **The current GCN architecture does not consume these edge attributes**; message passing uses the graph connectivity represented by `edge_index`.
 
+The task is node-level binary classification: predicting whether each macro belongs to the congested class under the synthetic labelling rule.
+
+### 2. Why Graph Convolutional Networks?
+
+An individual macro's geometric features do not describe its connectivity to other macros.
+
+Graph Convolutional Networks address this by aggregating information from neighbouring nodes through message passing.
+
+Conceptually, a node representation is updated using information from its neighbourhood:
+
+\[
+H^{(k+1)} =
+\sigma\left(
+\hat{D}^{-1/2}
+\hat{A}
+\hat{D}^{-1/2}
+H^{(k)}W^{(k)}
+\right)
+\]
+
+where:
+
+- \(\hat{A}\) is the adjacency matrix with self-loops.
+- \(\hat{D}\) is the corresponding degree matrix.
+- \(H^{(k)}\) contains node representations at layer \(k\).
+- \(W^{(k)}\) is a trainable weight matrix.
+- \(\sigma\) is a nonlinear activation.
+
+With three graph convolutional layers, each node can incorporate information from its graph neighbourhood up to three hops away.
+
+### 3. Model Architecture
+
+The model consists of three graph convolutional layers followed by a linear classification layer.
+
+```text
+Input Node Features (6)
+        |
+        v
+GCNConv (6 -> 64)
+        |
+   BatchNorm
+        |
+      ReLU
+        |
+   Dropout (0.3)
+        |
+        v
+GCNConv (64 -> 64)
+        |
+   BatchNorm
+        |
+      ReLU
+        |
+   Dropout (0.3)
+        |
+        v
+GCNConv (64 -> 32)
+        |
+      ReLU
+        |
+        v
+Linear (32 -> 2)
+        |
+        v
+   Class Logits
 ```
-h_v^(k) = ReLU( W^(k) · MEAN({ h_u^(k-1) : u ∈ N(v) ∪ {v} }) )
-```
 
-After *k* layers, each node's representation encodes information from its *k-hop neighbourhood*. With 3 layers, a macro "sees" context up to 3 hops away — capturing cluster-level congestion patterns.
+**Trainable parameters:** 7,010
 
-**Example:** Macro M5 with degree 6 sitting next to M2 (degree 4, close proximity) will accumulate high aggregated features after 2 hops, even if M5's own coordinates look innocent.
-
-### Architecture
-
-```
-Input (6)
-  └─▶  GCNConv(6→64)  →  BatchNorm  →  ReLU  →  Dropout(0.3)
-         └─▶  GCNConv(64→64)  →  BatchNorm  →  ReLU  →  Dropout(0.3)
-                └─▶  GCNConv(64→32)  →  ReLU
-                       └─▶  Linear(32→2)  →  Logits
-```
-
-Total trainable parameters: ~12,500
+The output contains two logits per macro, corresponding to the clear and congested classes.
 
 ---
 
-## Data Generation
+## Synthetic Data Generation
 
-Since real VLSI floorplans are proprietary, we generate synthetic ones using:
+Real industrial floorplans and routing data are not included in this project. Instead, the dataset generator creates synthetic floorplans.
 
-- **Macro placement:** Random AABB placement on a 100×100 canvas
-- **Connectivity:** Erdős–Rényi random graph with average degree ~3 (tunable)
-- **Congestion label:** Heuristic combining normalised net degree, spatial proximity of neighbours, and macro overlap — thresholded at 0.45
+### Generation process
 
-```bash
-python data_gen/generate_placements.py
-# Generates: data/train.json (700), data/val.json (150), data/test.json (150)
-```
+- **Macro placement:** Randomly generated macro positions and dimensions on a 100 × 100 canvas.
+- **Connectivity:** Erdős–Rényi random graphs with a configurable average degree.
+- **Macro geometry:** Random macro widths and heights.
+- **Dataset splits:** Separate training, validation, and test datasets.
 
-The heuristic models the intuition that congestion arises from **wire demand** (degree) meeting **spatial crowding** (proximity) — a reasonable first-order approximation of HPWL-based congestion estimation.
+The default generation configuration produces:
+
+| Split | Number of floorplans |
+|---|---:|
+| Training | 700 |
+| Validation | 150 |
+| Test | 150 |
+| **Total** | **1,000** |
+
+### Congestion Label Generation
+
+Congestion labels are generated using a weighted heuristic based on three components:
+
+1. **Connectivity:** Normalised node degree.
+2. **Spatial proximity:** Average Manhattan distance to connected neighbours.
+3. **Macro overlap:** Number of overlapping macros, subject to a cap.
+
+The components are combined using the following weights:
+
+\[
+S(v) =
+0.4D(v) +
+0.4P(v) +
+0.2O(v)
+\]
+
+where \(D(v)\), \(P(v)\), and \(O(v)\) represent the normalised degree, proximity, and overlap scores.
+
+A macro is labelled congested when:
+
+\[
+S(v) > 0.45
+\]
+
+These labels are synthetic heuristic targets. They are not obtained from a physical-design tool, detailed routing, congestion maps, or measured routing overflow.
 
 ---
 
@@ -111,80 +206,125 @@ pip install torch-geometric
 pip install -r requirements.txt
 ```
 
-> For GPU: replace the torch install with your CUDA version. See [pytorch.org](https://pytorch.org/get-started/locally/).
+For GPU execution, install the PyTorch build compatible with your CUDA environment. Refer to the official [PyTorch installation guide](https://pytorch.org/get-started/locally/).
 
-### 2. Generate data
+### 2. Generate the dataset
 
 ```bash
 python data_gen/generate_placements.py
 ```
 
-### 3. Train
+This generates:
+
+```text
+data/
+├── train.json
+├── val.json
+└── test.json
+```
+
+### 3. Train the model
 
 ```bash
 python train.py
 ```
 
-Training logs are saved to `results/training_log.csv`. Best checkpoint saved to `results/best_model.pt` based on validation F1.
+Training includes:
 
-Example output:
-```
- Epoch  TrLoss     TrF1  VaLoss     VaF1
-----------------------------------------------
-     1   0.6821   0.4312   0.6754   0.4501
-    10   0.5103   0.6811   0.5289   0.6540
-    30   0.3872   0.7903   0.4102   0.7681
-    52   0.3014   0.8234   0.3891   0.7990  ← checkpoint
+- Class-weighted cross-entropy loss.
+- Training and validation evaluation.
+- Validation-based checkpoint selection.
+- Early stopping based on validation performance.
+- Final evaluation on the held-out test split.
+
+The best checkpoint is saved at:
+
+```text
+results/best_model.pt
 ```
 
-### 4. Predict + Visualise
+Training metrics are saved in:
+
+```text
+results/training_log.csv
+```
+
+### 4. Run inference
 
 ```bash
 python predict.py --sample 5 --split test
 ```
 
-Outputs a colour-coded floorplan PNG comparing ground truth vs GCN prediction:
+You can also specify a checkpoint:
 
-| Ground Truth | GCN Prediction |
-|:---:|:---:|
-| Binary labels from heuristic | Soft congestion probability |
+```bash
+python predict.py --sample 5 --split test --checkpoint results/best_model.pt
+```
 
-Macros coloured **red = congested**, **green = clear**. Net edges shown as faint white lines.
+The script prints per-macro congestion probabilities and generates a visualisation:
 
----
+```text
+results/prediction_sample_<id>.png
+```
 
-## Results
+The visualisation compares:
 
-Evaluated on 150 held-out test floorplans (~2,200 macro nodes):
+- Ground-truth binary labels generated by the heuristic.
+- Predicted congestion probabilities from the GCN.
 
-| Metric | Value |
-|---|---|
-| Test Accuracy | ~82% |
-| Test F1 (congested class) | ~0.78 |
-| Inference time (CPU, single graph) | < 5 ms |
-
-The model achieves approximately 82% test accuracy and 0.78 F1 on held-out synthetic floorplans. These results suggest that graph-based spatial and connectivity features can capture useful congestion patterns within the simulated data distribution. Validation on real-world floorplans remains future work.
-
-**Ablation note:** Removing edge attributes (wire length) drops F1 by ~4%, confirming that wire length context helps beyond node features alone.
+Red indicates a higher congestion score or probability, while green indicates a lower value.
 
 ---
 
-## Limitations & Future Work
+## Evaluation
 
-- **Synthetic data:** Real floorplans have non-trivial macro shapes, fixed cells, and power grid constraints not modelled here. The next step is integrating with open-source benchmarks (e.g. ISPD contest floorplans).
-- **Binary labels:** Actual congestion is a scalar (overflow count per bin). A regression formulation (predicting overflow magnitude) would be more actionable.
-- **Edge features:** Currently only Manhattan distance. Incorporating bus widths or net criticality (timing-driven) could improve precision.
-- **GNN variant:** GAT (Graph Attention Network) would allow the model to learn *which neighbours matter more*, potentially improving on the uniform aggregation in GCN.
+The model is evaluated as a node-level binary classifier.
+
+The training pipeline tracks classification metrics including:
+
+- Accuracy
+- Balanced accuracy
+- Precision
+- Recall
+- Specificity
+- F1-score
+- Matthews correlation coefficient (MCC)
+
+The validation split is used for checkpoint selection and early stopping. The held-out test split is reserved for final evaluation.
+
+**Numerical performance results are not reported here until verified against an actual completed training run and its saved evaluation outputs**
 
 ---
 
-## Background & References
+## Limitations and Future Work
 
-This project is motivated by the Smart Floorplan problem: using historical placement data to predict design quality metrics before committing to full PD runs.
+The current implementation is an exploratory synthetic-data experiment. Several extensions are needed before it can be considered a practical physical-design congestion predictor
 
-- Kipf & Welling — *Semi-Supervised Classification with Graph Convolutional Networks* (ICLR 2017)
-- Mirhoseini et al. — *A graph placement methodology for fast chip design* (Nature 2021) — inspiration for graph-based chip design ML
-- Hamilton et al. — *Inductive Representation Learning on Large Graphs* (NeurIPS 2017)
+### Current limitations
+
+- **Synthetic floorplans:** The generator does not reproduce the full complexity of industrial chip layouts.
+- **Heuristic labels:** Congestion targets are derived from manually defined geometric and graph-based rules rather than actual routing outcomes.
+- **Random placement:** The generator does not enforce non-overlapping macro placement.
+- **Edge attributes:** Manhattan distances are stored in the dataset but are not currently used by the GCN.
+- **Simplified connectivity:** Erdős–Rényi graphs do not capture the full structure of real circuit netlists.
+- **No physical-design validation:** Predictions have not been validated against routing overflow or congestion maps from an EDA tool.
+
+### Potential extensions
+
+- Integrating open-source VLSI placement and routing benchmarks.
+- Generating labels from actual routing congestion maps.
+- Incorporating edge attributes into a message-passing architecture.
+- Investigating attention-based graph models such as Graph Attention Networks.
+- Exploring regression models for predicting continuous congestion metrics.
+- Evaluating generalisation across different floorplan sizes and connectivity distributions.
+
+---
+
+## References
+
+- Kipf, T. N. and Welling, M. (2017). *Semi-Supervised Classification with Graph Convolutional Networks*. ICLR.
+- Hamilton, W. L., Ying, R. and Leskovec, J. (2017). *Inductive Representation Learning on Large Graphs*. NeurIPS.
+- Mirhoseini, A. et al. (2021). *A graph placement methodology for fast chip design*. Nature.
 
 ---
 
@@ -197,4 +337,4 @@ BITS Pilani, K.K. Birla Goa Campus
 
 [GitHub](https://github.com/la9fer) · [LinkedIn](https://www.linkedin.com/in/lakshya-arora-51100329a/)
 
-Built as part of exploring machine learning applications in physical design workflows.
+An experimental exploration of graph neural networks for machine learning applications in physical design workflows
