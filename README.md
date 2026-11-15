@@ -201,8 +201,10 @@ These labels are synthetic heuristic targets. They are not obtained from a physi
 ### 1. Install dependencies
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install torch-geometric
+# Install PyTorch (CPU version)
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install project dependencies
 pip install -r requirements.txt
 ```
 
