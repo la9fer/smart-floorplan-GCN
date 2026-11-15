@@ -1,184 +1,613 @@
-"""
-train.py
---------
-Training loop for the FloorplanGCN model.
 
-Handles:
-    - Class imbalance via weighted cross-entropy loss
-    - Early stopping on validation F1
-    - Checkpoint saving (best model)
-    - Per-epoch logging to results/training_log.csv
+"""
+Training pipeline for the FloorplanGCN model.
+
+Features:
+    - Weighted cross-entropy for class imbalance
+    - Training and validation monitoring
+    - Early stopping based on validation F1
+    - Learning-rate reduction on validation loss plateau
+    - Best-model checkpoint saving
+    - Per-epoch CSV logging
+    - Final held-out test evaluation
+
+The test set is used only after model selection.
 
 Run:
     python train.py
-
-Author: [Your Name]
 """
 
 import os
 import csv
 import time
+import random
+
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
+
 from torch_geometric.loader import DataLoader
-from sklearn.metrics import f1_score, accuracy_score
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+)
 
 from model.dataset import FloorplanDataset
 from model.gcn_model import FloorplanGCN, count_parameters
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# Configuration
 CONFIG = {
-    "data_dir"    : "data",
-    "results_dir" : "results",
-    "checkpoint"  : "results/best_model.pt",
-    "batch_size"  : 16,
-    "hidden_dim"  : 64,
-    "dropout"     : 0.3,
-    "lr"          : 1e-3,
+    "data_dir": "data",
+    "results_dir": "results",
+    "checkpoint": "results/best_model.pt",
+
+    "batch_size": 16,
+    "hidden_dim": 64,
+    "dropout": 0.3,
+
+    "lr": 1e-3,
     "weight_decay": 1e-4,
-    "epochs"      : 80,
-    "patience"    : 15,       # early stopping patience
-    "device"      : "cuda" if torch.cuda.is_available() else "cpu",
+
+    "epochs": 80,
+    "patience": 15,
+
+    "seed": 42,
+
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
+# Reproducibility
+def set_seed(seed=42):
 
-# ── Data ─────────────────────────────────────────────────────────────────────
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+# Dataset loading
 def load_data(cfg):
-    train_ds = FloorplanDataset(root=cfg["data_dir"], split="train")
-    val_ds   = FloorplanDataset(root=cfg["data_dir"], split="val")
-    test_ds  = FloorplanDataset(root=cfg["data_dir"], split="test")
 
-    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=cfg["batch_size"], shuffle=False)
-    test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"], shuffle=False)
+    train_ds = FloorplanDataset(
+        root=cfg["data_dir"],
+        split="train"
+    )
 
-    # Estimate class weight to handle imbalance
-    # (congested nodes may be a minority)
-    all_labels = [l for s in train_ds for l in s.y.numpy()]
-    pos = sum(all_labels)
-    neg = len(all_labels) - pos
-    # weight[1] scales up the loss for congested (minority) class
-    class_weight = torch.tensor([1.0, neg / max(pos, 1)], dtype=torch.float)
-    print(f"[data] train={len(train_ds)}, val={len(val_ds)}, test={len(test_ds)}")
-    print(f"[data] class weight: {class_weight}")
-    return train_loader, val_loader, test_loader, class_weight
+    val_ds = FloorplanDataset(
+        root=cfg["data_dir"],
+        split="val"
+    )
 
+    test_ds = FloorplanDataset(
+        root=cfg["data_dir"],
+        split="test"
+    )
 
-# ── Train/eval helpers ───────────────────────────────────────────────────────
-def train_epoch(model, loader, optimizer, criterion, device):
-    model.train()
+    if len(train_ds) == 0 or len(val_ds) == 0 or len(test_ds) == 0:
+        raise ValueError(
+            "Training, validation and test datasets must all be non-empty."
+        )
+
+    # Verify binary labels in each partition
+    for name, dataset in [
+        ("Training", train_ds),
+        ("Validation", val_ds),
+        ("Test", test_ds),
+    ]:
+
+        labels = torch.cat([
+            graph.y
+            for graph in dataset
+        ])
+
+        classes = set(labels.unique().tolist())
+
+        if not classes.issubset({0, 1}) or not classes:
+            raise ValueError(
+                f"{name} dataset contains invalid labels: {classes}"
+            )
+
+        print(
+            f"[data] {name}: "
+            f"{len(labels)} nodes | "
+            f"not congested: {(labels == 0).sum().item()} | "
+            f"congested: {(labels == 1).sum().item()}"
+        )
+
+    # Reproducible shuffling
+    generator = torch.Generator()
+    generator.manual_seed(cfg["seed"])
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        generator=generator,
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=cfg["batch_size"],
+        shuffle=False,
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=cfg["batch_size"],
+        shuffle=False,
+    )
+
+    # Calculate class weights using training labels only
+    all_labels = torch.cat([
+        graph.y
+        for graph in train_ds
+    ])
+
+    class_counts = torch.bincount(
+        all_labels,
+        minlength=2
+    ).float()
+
+    if torch.any(class_counts == 0):
+        raise ValueError(
+            "Both classes must be present in the training dataset."
+        )
+
+    total = class_counts.sum()
+
+    class_weight = total / (2.0 * class_counts)
+
+    print("\n[data] Class weights:", class_weight.tolist())
+
+    print(
+        f"[data] Graphs -> "
+        f"train={len(train_ds)}, "
+        f"val={len(val_ds)}, "
+        f"test={len(test_ds)}"
+    )
+
+    return (
+        train_loader,
+        val_loader,
+        test_loader,
+        class_weight,
+    )
+
+# Metric calculation
+def calculate_metrics(all_labels, all_preds):
+
+    all_labels = np.asarray(all_labels)
+    all_preds = np.asarray(all_preds)
+
+    tn, fp, fn, tp = confusion_matrix(
+        all_labels,
+        all_preds,
+        labels=[0, 1]
+    ).ravel()
+
+    specificity = (
+        tn / (tn + fp)
+        if (tn + fp) > 0
+        else 0.0
+    )
+
+    return {
+        "accuracy": accuracy_score(all_labels, all_preds),
+
+        "balanced_accuracy": balanced_accuracy_score(
+            all_labels,
+            all_preds
+        ),
+
+        "precision": precision_score(
+            all_labels,
+            all_preds,
+            zero_division=0
+        ),
+
+        "recall": recall_score(
+            all_labels,
+            all_preds,
+            zero_division=0
+        ),
+
+        "specificity": specificity,
+
+        "f1": f1_score(
+            all_labels,
+            all_preds,
+            zero_division=0
+        ),
+
+        "mcc": matthews_corrcoef(
+            all_labels,
+            all_preds
+        ),
+    }
+
+# Training and evaluation
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    device,
+    optimizer=None,
+):
+    """
+    Run one training or evaluation epoch.
+
+    If optimizer is supplied, model parameters are updated.
+    Otherwise, the model is evaluated without gradient tracking.
+    """
+
+    training = optimizer is not None
+
+    if training:
+        model.train()
+    else:
+        model.eval()
+
     total_loss = 0.0
-    all_preds, all_labels = [], []
+    total_loss_weight = 0.0
 
-    for batch in loader:
-        batch = batch.to(device)
-        optimizer.zero_grad()
-        logits = model(batch.x, batch.edge_index)
-        loss = criterion(logits, batch.y)
-        loss.backward()
-        optimizer.step()
+    all_preds = []
+    all_labels = []
 
-        total_loss += loss.item() * batch.num_graphs
-        preds = logits.argmax(dim=-1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(batch.y.cpu().numpy())
+    context = torch.enable_grad() if training else torch.no_grad()
 
-    avg_loss = total_loss / len(loader.dataset)
-    f1  = f1_score(all_labels, all_preds, zero_division=0)
-    acc = accuracy_score(all_labels, all_preds)
-    return avg_loss, f1, acc
+    with context:
 
+        for batch in loader:
 
-@torch.no_grad()
-def eval_epoch(model, loader, criterion, device):
-    model.eval()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
+            batch = batch.to(device)
 
-    for batch in loader:
-        batch = batch.to(device)
-        logits = model(batch.x, batch.edge_index)
-        loss = criterion(logits, batch.y)
+            if training:
+                optimizer.zero_grad()
 
-        total_loss += loss.item() * batch.num_graphs
-        preds = logits.argmax(dim=-1).cpu().numpy()
-        all_preds.extend(preds)
-        all_labels.extend(batch.y.cpu().numpy())
+            logits = model(
+                batch.x,
+                batch.edge_index
+            )
 
-    avg_loss = total_loss / len(loader.dataset)
-    f1  = f1_score(all_labels, all_preds, zero_division=0)
-    acc = accuracy_score(all_labels, all_preds)
-    return avg_loss, f1, acc
+            loss = criterion(
+                logits,
+                batch.y
+            )
 
+            if training:
+                loss.backward()
+                optimizer.step()
 
-# ── Main training loop ───────────────────────────────────────────────────────
+            # Weighted CrossEntropyLoss with mean reduction
+            # divides by the sum of target-class weights
+            # Accumulate using that denominator to obtain an
+            # appropriately aggregated epoch loss
+            batch_loss_weight = criterion.weight[batch.y].sum().item()
+
+            total_loss += loss.item() * batch_loss_weight
+            total_loss_weight += batch_loss_weight
+
+            preds = logits.argmax(dim=-1)
+
+            all_preds.extend(
+                preds.detach().cpu().numpy()
+            )
+
+            all_labels.extend(
+                batch.y.detach().cpu().numpy()
+            )
+
+    if total_loss_weight == 0:
+        raise ValueError("No nodes were processed during the epoch.")
+
+    avg_loss = total_loss / total_loss_weight
+
+    metrics = calculate_metrics(
+        all_labels,
+        all_preds
+    )
+
+    return avg_loss, metrics
+
+# Main training loop
 def train(cfg=CONFIG):
-    os.makedirs(cfg["results_dir"], exist_ok=True)
+
+    set_seed(cfg["seed"])
+
+    os.makedirs(
+        cfg["results_dir"],
+        exist_ok=True
+    )
+
+    checkpoint_dir = os.path.dirname(
+        cfg["checkpoint"]
+    )
+
+    if checkpoint_dir:
+        os.makedirs(
+            checkpoint_dir,
+            exist_ok=True
+        )
+
     device = torch.device(cfg["device"])
+
     print(f"[train] Using device: {device}")
 
-    train_loader, val_loader, test_loader, class_weight = load_data(cfg)
+    (
+        train_loader,
+        val_loader,
+        test_loader,
+        class_weight,
+    ) = load_data(cfg)
 
-    model = FloorplanGCN(in_channels=6, hidden_dim=cfg["hidden_dim"], dropout=cfg["dropout"])
-    model = model.to(device)
-    print(f"[model] Parameters: {count_parameters(model):,}")
+    # Model construction
+    model = FloorplanGCN(
+        in_channels=6,
+        hidden_dim=cfg["hidden_dim"],
+        dropout=cfg["dropout"]
+    ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=7, factor=0.5)
-    criterion = nn.CrossEntropyLoss(weight=class_weight.to(device))
+    print(
+        f"[model] Trainable parameters: "
+        f"{count_parameters(model):,}"
+    )
 
-    # ── Logging setup ─────────────────────────────────────────────────────
-    log_path = os.path.join(cfg["results_dir"], "training_log.csv")
-    with open(log_path, "w", newline="") as f:
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg["lr"],
+        weight_decay=cfg["weight_decay"]
+    )
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        patience=7,
+        factor=0.5
+    )
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weight.to(device)
+    )
+
+    # CSV logging
+    log_path = os.path.join(
+        cfg["results_dir"],
+        "training_log.csv"
+    )
+
+    columns = [
+        "epoch",
+        "train_loss",
+        "train_f1",
+        "train_accuracy",
+        "val_loss",
+        "val_f1",
+        "val_accuracy",
+        "val_precision",
+        "val_recall",
+        "val_specificity",
+        "learning_rate",
+    ]
+
+    with open(
+        log_path,
+        "w",
+        newline=""
+    ) as f:
+
         writer = csv.writer(f)
-        writer.writerow(["epoch", "train_loss", "train_f1", "train_acc",
-                         "val_loss", "val_f1", "val_acc", "lr"])
+        writer.writerow(columns)
 
-    best_val_f1  = 0.0
-    patience_cnt = 0
+    best_val_f1 = -float("inf")
+    patience_count = 0
 
-    print(f"\n{'Epoch':>6} {'TrLoss':>8} {'TrF1':>7} {'VaLoss':>8} {'VaF1':>7}")
-    print("-" * 45)
+    print(
+        f"\n{'Epoch':>6} "
+        f"{'TrLoss':>9} "
+        f"{'TrF1':>8} "
+        f"{'VaLoss':>9} "
+        f"{'VaF1':>8}"
+    )
 
+    print("-" * 55)
+
+    # Epoch loop
     for epoch in range(1, cfg["epochs"] + 1):
-        t0 = time.time()
-        tr_loss, tr_f1, tr_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-        va_loss, va_f1, va_acc = eval_epoch(model, val_loader,   criterion, device)
-        scheduler.step(va_loss)
 
-        lr_now = optimizer.param_groups[0]["lr"]
+        start_time = time.time()
 
-        # ── Log ──────────────────────────────────────────────────────────
-        with open(log_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch, f"{tr_loss:.4f}", f"{tr_f1:.4f}", f"{tr_acc:.4f}",
-                                    f"{va_loss:.4f}", f"{va_f1:.4f}", f"{va_acc:.4f}", lr_now])
+        train_loss, train_metrics = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer=optimizer,
+        )
 
-        print(f"{epoch:>6} {tr_loss:>8.4f} {tr_f1:>7.4f} {va_loss:>8.4f} {va_f1:>7.4f}  "
-              f"({time.time()-t0:.1f}s)")
+        val_loss, val_metrics = run_epoch(
+            model,
+            val_loader,
+            criterion,
+            device,
+        )
 
-        # ── Checkpoint ───────────────────────────────────────────────────
-        if va_f1 > best_val_f1:
-            best_val_f1 = va_f1
-            torch.save(model.state_dict(), cfg["checkpoint"])
-            patience_cnt = 0
+        scheduler.step(val_loss)
+
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Save epoch metrics
+        with open(
+            log_path,
+            "a",
+            newline=""
+        ) as f:
+
+            writer = csv.writer(f)
+
+            writer.writerow([
+                epoch,
+                f"{train_loss:.6f}",
+                f"{train_metrics['f1']:.6f}",
+                f"{train_metrics['accuracy']:.6f}",
+                f"{val_loss:.6f}",
+                f"{val_metrics['f1']:.6f}",
+                f"{val_metrics['accuracy']:.6f}",
+                f"{val_metrics['precision']:.6f}",
+                f"{val_metrics['recall']:.6f}",
+                f"{val_metrics['specificity']:.6f}",
+                current_lr,
+            ])
+
+        elapsed = time.time() - start_time
+
+        print(
+            f"{epoch:>6} "
+            f"{train_loss:>9.4f} "
+            f"{train_metrics['f1']:>8.4f} "
+            f"{val_loss:>9.4f} "
+            f"{val_metrics['f1']:>8.4f} "
+            f"({elapsed:.1f}s)"
+        )
+
+        # Checkpoint selection using validation F1
+        if val_metrics["f1"] > best_val_f1:
+
+            best_val_f1 = val_metrics["f1"]
+
+            torch.save(
+                model.state_dict(),
+                cfg["checkpoint"]
+            )
+
+            patience_count = 0
+
+            print(
+                f"        [checkpoint] "
+                f"Best validation F1: {best_val_f1:.4f}"
+            )
+
         else:
-            patience_cnt += 1
-            if patience_cnt >= cfg["patience"]:
-                print(f"\n[train] Early stopping at epoch {epoch}.")
-                break
 
-    # ── Final test evaluation ─────────────────────────────────────────────
-    model.load_state_dict(torch.load(cfg["checkpoint"], map_location=device))
-    te_loss, te_f1, te_acc = eval_epoch(model, test_loader, criterion, device)
-    print(f"\n{'='*45}")
-    print(f"[test]  Loss={te_loss:.4f}  F1={te_f1:.4f}  Acc={te_acc:.4f}")
-    print(f"[test]  Best val F1: {best_val_f1:.4f}")
-    print(f"[test]  Checkpoint: {cfg['checkpoint']}")
-    print(f"{'='*45}")
+            patience_count += 1
+
+        # Early stopping
+        if patience_count >= cfg["patience"]:
+
+            print(
+                f"\n[train] Early stopping at epoch {epoch}."
+            )
+
+            break
+
+    # Final test evaluation
+    # The test set is evaluated only after model selection
+    # It is not used for early stopping or checkpoint selection
+
+    if not os.path.exists(cfg["checkpoint"]):
+        raise FileNotFoundError(
+            "Best model checkpoint was not created."
+        )
+
+    state_dict = torch.load(
+        cfg["checkpoint"],
+        map_location=device
+    )
+
+    model.load_state_dict(state_dict)
+
+    test_loss, test_metrics = run_epoch(
+        model,
+        test_loader,
+        criterion,
+        device,
+    )
+
+    print("\n" + "=" * 60)
+    print("FINAL TEST RESULTS")
+    print("=" * 60)
+
+    print(f"Test loss:           {test_loss:.4f}")
+
+    for name, value in test_metrics.items():
+        print(f"{name:20s}: {value:.4f}")
+
+    print(f"\nBest validation F1: {best_val_f1:.4f}")
+
+    print(
+        f"Checkpoint: {cfg['checkpoint']}"
+    )
+
+    print(
+        f"Training log: {log_path}"
+    )
+
+    print("\nClassification report:")
+
+    # Recompute predictions for a readable classification report
+    model.eval()
+
+    all_preds = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for batch in test_loader:
+
+            batch = batch.to(device)
+
+            logits = model(
+                batch.x,
+                batch.edge_index
+            )
+
+            preds = logits.argmax(dim=-1)
+
+            all_preds.extend(
+                preds.cpu().numpy()
+            )
+
+            all_labels.extend(
+                batch.y.cpu().numpy()
+            )
+
+    print(
+        classification_report(
+            all_labels,
+            all_preds,
+            labels=[0, 1],
+            target_names=[
+                "Not congested",
+                "Congested"
+            ],
+            zero_division=0
+        )
+    )
+
+    print("Confusion matrix:")
+
+    print(
+        confusion_matrix(
+            all_labels,
+            all_preds,
+            labels=[0, 1]
+        )
+    )
+
+    print("=" * 60)
 
     return model
-
 
 if __name__ == "__main__":
     train()
